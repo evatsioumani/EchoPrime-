@@ -1,0 +1,408 @@
+"""
+EchoPrime — Batch Inference Script (Διορθωμένη Έκδοση)
+=======================================================
+Διορθώσεις σε σχέση με την αρχική έκδοση:
+
+  [BUG-1] CRITICAL  Resume mode data loss:
+                    Το run_batch() αντικαθιστούσε το existing CSV από το 1ο
+                    νέο study, χάνοντας όλα τα προηγούμενα αποτελέσματα.
+                    → existing_df περνιέται ως παράμετρος στο run_batch()
+                      και συμπεριλαμβάνεται σε κάθε incremental save.
+
+  [BUG-2] MEDIUM    device parameter silently ignored:
+                    Το EchoPrime.__init__ αντικαθιστούσε αμέσως την device
+                    παράμετρο με auto-detect, αγνοώντας την επιλογή του χρήστη.
+                    → Η διόρθωση γίνεται στο process_dicoms_fixed.py (__init__).
+
+  [DET-1] CRITICAL  Απουσία set_deterministic():
+                    Χωρίς seed/deterministic flags, τα CUDA ops και το
+                    glob ordering παράγουν διαφορετικά αποτελέσματα σε
+                    κάθε εκτέλεση.
+                    → set_deterministic(seed=42) καλείται στην αρχή του main().
+
+  [DET-2] MEDIUM    Unsorted glob στο process_dicoms:
+                    → Διορθώθηκε στο process_dicoms_fixed.py.
+
+  [DET-3] MEDIUM    view_classifier χωρίς map_location:
+                    → Διορθώθηκε στο process_dicoms_fixed.py (__init__).
+"""
+
+import gc
+import json
+import logging
+import os
+import random
+import traceback
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+
+
+# ─── Logging setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+log = logging.getLogger("EchoPrimeBatch")
+
+
+# ─── Determinism ──────────────────────────────────────────────────────────────
+def set_deterministic(seed: int = 42) -> None:
+    """
+    Εγγυάται πλήρως reproducible inference.
+
+    Καλύπτει:
+      - Python / NumPy / PyTorch RNG seeds
+      - cuDNN deterministic mode (απενεργοποιεί autotuner)
+      - CUBLAS workspace για deterministic GEMM
+      - torch.use_deterministic_algorithms (PyTorch >= 1.8)
+
+    ΠΡΟΣΟΧΗ: torch.use_deterministic_algorithms(True) μπορεί να πετάξει
+    RuntimeError αν κάποια op δεν έχει deterministic υλοποίηση.
+    Σε αυτή την περίπτωση αλλαξε σε warn_only=True παρακάτω.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    try:
+        torch.use_deterministic_algorithms(True)
+    except AttributeError:
+        # PyTorch < 1.8 — δεν υποστηρίζεται, συνεχίζουμε
+        log.warning("torch.use_deterministic_algorithms μη διαθέσιμο "
+                    "(PyTorch < 1.8) — μερική determinism")
+    except RuntimeError as e:
+        # Κάποια op δεν έχει deterministic implementation
+        log.warning(f"use_deterministic_algorithms(True) απέτυχε: {e}\n"
+                    "Δοκίμασε warn_only=True αν χρειάζεται.")
+    log.info(f"Deterministic mode ενεργό (seed={seed})")
+
+
+# ─── Stress Echo exclusion list ───────────────────────────────────────────────
+def load_exclusion_list(exclusion_list_path) -> set:
+    """
+    Διαβάζει .txt αρχείο με ένα study_id ανά γραμμή.
+    Γραμμές που ξεκινούν με # αγνοούνται (comments).
+    """
+    if exclusion_list_path is None:
+        return set()
+
+    path = Path(exclusion_list_path)
+    if not path.exists():
+        log.warning(
+            f"Exclusion list δεν βρέθηκε: {path} — συνεχίζω χωρίς εξαιρέσεις"
+        )
+        return set()
+
+    ids = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            ids.add(line)
+
+    log.info(f"Exclusion list: {len(ids)} stress echo studies θα παραλειφθούν")
+    return ids
+
+
+# ─── Study discovery ──────────────────────────────────────────────────────────
+def discover_studies(dataset_root: Path, exclusion_ids: set) -> list:
+    """
+    Επιστρέφει sorted λίστα study folders που:
+      - ΔΕΝ είναι στην exclusion list (stress echo)
+      - Έχουν τουλάχιστον ένα .dcm αρχείο στον echo/ υποφάκελο
+
+    Η ταξινόμηση (sorted) εξασφαλίζει deterministic σειρά επεξεργασίας
+    ανεξάρτητα από το filesystem.
+    """
+    studies         = []
+    skipped_stress  = 0
+    skipped_novideo = 0
+
+    # sorted() εξασφαλίζει deterministic σειρά [DET-2 για folder discovery]
+    for folder in sorted(dataset_root.iterdir()):
+        if not folder.is_dir():
+            continue
+
+        study_id = folder.name
+
+        # Έλεγχος exclusion list
+        if study_id in exclusion_ids:
+            log.info(f"  [ΕΞΑΙΡΕΣΗ — Stress Echo] {study_id}")
+            skipped_stress += 1
+            continue
+
+        # Έλεγχος ύπαρξης echo/ υποφακέλου με .dcm αρχεία
+        echo_folder = folder / "echo"
+        if not echo_folder.exists():
+            log.warning(f"  [ΠΑΡΑΛΕΙΨΗ — Δεν βρέθηκε echo/] {study_id}")
+            skipped_novideo += 1
+            continue
+
+        dcm_files = list(echo_folder.glob("*.dcm"))
+        if not dcm_files:
+            log.warning(f"  [ΠΑΡΑΛΕΙΨΗ — Δεν βρέθηκαν .dcm αρχεία] {study_id}")
+            skipped_novideo += 1
+            continue
+
+        studies.append(folder)
+
+    log.info(
+        f"Ανακάλυψη: {len(studies)} studies προς επεξεργασία | "
+        f"{skipped_stress} εξαιρέθηκαν (stress echo) | "
+        f"{skipped_novideo} παραλείφθηκαν (χωρίς .dcm)"
+    )
+    return studies
+
+
+# ─── Inference ενός study ─────────────────────────────────────────────────────
+def run_single_study(ep, study_path: Path):
+    """
+    Εκτελεί τα 3 βήματα του EchoPrimeDemo.ipynb για ένα study.
+    Επιστρέφει dict με τα phenotypes ή None αν αποτύχει.
+    """
+    study_id    = study_path.name
+    echo_folder = str(study_path / "echo")
+
+    # ── Βήμα 1: Preprocessing ─────────────────────────────────────────────
+    # Η sorted glob εφαρμόζεται εσωτερικά στο process_dicoms (βλ. [DET-2]
+    # στο process_dicoms_fixed.py)
+    try:
+        stack_of_videos = ep.process_dicoms(echo_folder)
+    except Exception:
+        log.error(
+            f"  [ΑΠΟΤΥΧΙΑ PREPROCESSING] {study_id}\n{traceback.format_exc()}"
+        )
+        return None
+
+    if stack_of_videos is None or stack_of_videos.shape[0] == 0:
+        log.warning(f"  [ΑΔΕΙΟ] {study_id} — κανένα έγκυρο video")
+        return None
+
+    log.debug(f"  {study_id}: {stack_of_videos.shape[0]} videos φορτώθηκαν")
+
+    # ── Βήμα 2: Encoding ──────────────────────────────────────────────────
+    try:
+        encoded_study = ep.encode_study(stack_of_videos)
+    except Exception:
+        log.error(
+            f"  [ΑΠΟΤΥΧΙΑ ENCODING] {study_id}\n{traceback.format_exc()}"
+        )
+        return None
+    finally:
+        # Αποδέσμευση RAM/VRAM μετά το encoding
+        del stack_of_videos
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    # ── Βήμα 3: Prediction ────────────────────────────────────────────────
+    try:
+        preds = ep.predict_metrics(encoded_study)
+    except Exception:
+        log.error(
+            f"  [ΑΠΟΤΥΧΙΑ PREDICTION] {study_id}\n{traceback.format_exc()}"
+        )
+        return None
+    finally:
+        del encoded_study
+        gc.collect()
+
+    return preds
+
+
+# ─── Batch loop ───────────────────────────────────────────────────────────────
+def run_batch(
+    ep,
+    studies: list,
+    output_dir: Path,
+    existing_df: pd.DataFrame = None,   # [BUG-1 FIX] περνιέται από το main()
+) -> pd.DataFrame:
+    """
+    Επεξεργάζεται όλα τα studies και αποθηκεύει τα αποτελέσματα
+    incrementally στο CSV μετά από κάθε study (crash-safe).
+
+    [BUG-1 FIX]:
+        Το existing_df (αποτελέσματα από προηγούμενη εκτέλεση σε resume mode)
+        συμπεριλαμβάνεται από την αρχή στο all_rows. Έτσι κάθε incremental
+        save περιέχει ΚΑΙ τα παλιά ΚΑΙ τα νέα αποτελέσματα — ποτέ δεν
+        αντικαθίστανται.
+    """
+    results_path = output_dir / "predictions_raw_.csv"
+    failed_path  = output_dir / "failed_studies.txt"
+
+    # Ξεκίνα από existing results αν υπάρχουν (resume mode)
+    if existing_df is not None and not existing_df.empty:
+        all_rows = existing_df.to_dict("records")
+        log.info(f"  Φορτώθηκαν {len(all_rows)} existing αποτελέσματα στη μνήμη")
+    else:
+        all_rows = []
+
+    failed = []
+
+    for study_path in tqdm(studies, desc="Επεξεργασία studies", unit="study"):
+        study_id = study_path.name
+
+        preds = run_single_study(ep, study_path)
+
+        if preds is None:
+            failed.append(study_id)
+            continue
+
+        row = {"study_id": study_id, **preds}
+        all_rows.append(row)
+
+        # Incremental save — περιέχει ΠΑΝΤΑ existing + νέα (crash-safe)
+        pd.DataFrame(all_rows).to_csv(results_path, index=False)
+
+    if failed:
+        failed_path.write_text("\n".join(failed), encoding="utf-8")
+        log.warning(f"{len(failed)} studies απέτυχαν — δες {failed_path}")
+
+    df = pd.DataFrame(all_rows)
+    log.info(f"Predictions αποθηκεύτηκαν → {results_path}  ({len(df)} studies)")
+    return df
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main(dataset_root, output_dir, exclusion_list, device, resume,
+         max_studies=None):
+
+    dataset_root = Path(dataset_root)
+    output_dir   = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # [DET-1 FIX] Set deterministic mode ΠΡΙΝ από οτιδήποτε άλλο
+    SEED = 42
+    set_deterministic(seed=SEED)
+
+    # Αποθήκευση config για reproducibility
+    run_config = {
+        "dataset_root":   str(dataset_root),
+        "output_dir":     str(output_dir),
+        "exclusion_list": str(exclusion_list),
+        "device":         device,
+        "resume":         resume,
+        "max_studies":    max_studies,    # None = όλα, N = δοκιμαστική εκτέλεση
+        "seed":           SEED,
+        "timestamp":      datetime.now().isoformat(),
+    }
+    (output_dir / "run_config.json").write_text(
+        json.dumps(run_config, indent=2), encoding="utf-8"
+    )
+
+    # Φόρτωση exclusion list
+    exclusion_ids = load_exclusion_list(exclusion_list)
+
+    # Φόρτωση μοντέλου
+    # Χειρίζεται και τις δύο εκδοχές του EchoPrime.__init__:
+    #   - Νέα (διορθωμένη): δέχεται device=, lang= παραμέτρους
+    #   - Παλιά (original): δεν δέχεται παραμέτρους (auto-detect device)
+    log.info("Φόρτωση EchoPrime μοντέλου...")
+    import sys
+    ECHOPRIME_DIR = r"D:\Echo\EchoPrime\EchoPrime"  
+    if ECHOPRIME_DIR not in sys.path:
+       sys.path.insert(0, ECHOPRIME_DIR)
+
+    from echo_prime.model import EchoPrime
+    try:
+         ep = EchoPrime(device=device)
+         log.info(f"Μοντέλο φορτώθηκε με device={device}.")
+    except TypeError:
+         log.warning("EchoPrime() δεν δέχεται παραμέτρους — χρήση auto-detect device.")
+         ep = EchoPrime()
+         log.info("Μοντέλο φορτώθηκε (auto-detect device).")  
+
+    # Ανακάλυψη studies
+    studies = discover_studies(dataset_root, exclusion_ids)
+
+    # [BUG-1 FIX] Resume mode:
+    # Φόρτωσε existing_df ΠΡΙΝ το discover ώστε να το περάσουμε στο run_batch
+    existing_df = None
+    if resume:
+        done_path = output_dir / "predictions_raw_.csv"
+        if done_path.exists():
+            existing_df = pd.read_csv(done_path)
+            done_ids    = set(existing_df["study_id"].astype(str))
+            before      = len(studies)
+            studies     = [s for s in studies if s.name not in done_ids]
+            log.info(
+                f"Resume: παράλειψη {before - len(studies)} "
+                f"ήδη επεξεργασμένων studies "
+                f"({len(existing_df)} rows φορτώθηκαν)"
+            )
+
+    if not studies:
+        log.info("Δεν υπάρχουν studies προς επεξεργασία.")
+        return
+
+    # ── Δοκιμαστική εκτέλεση (pilot mode) ────────────────────────────────
+    # Αν max_studies=N, επεξεργάζεται μόνο τα πρώτα N studies.
+    # Τα αποτελέσματα αποθηκεύονται σε ξεχωριστό αρχείο (pilot_predictions.csv)
+    # ώστε να μην αναμειχθούν με το κύριο predictions_raw_.csv.
+    if max_studies is not None:
+        studies = studies[:max_studies]
+        log.info(
+            f"[PILOT MODE] Εκτέλεση σε {len(studies)} studies "
+            f"(max_studies={max_studies})"
+        )
+        pilot_output_dir = output_dir / "pilot"
+        pilot_output_dir.mkdir(parents=True, exist_ok=True)
+        active_output_dir = pilot_output_dir
+        # Στο pilot mode δεν φορτώνουμε existing_df —
+        # κάθε δοκιμή είναι ανεξάρτητη
+        active_existing_df = None
+    else:
+        active_output_dir  = output_dir
+        active_existing_df = existing_df
+
+    # [BUG-1 FIX] Πέρνα existing_df ώστε το run_batch να μην το αντικαταστήσει
+    predictions_df = run_batch(
+        ep,
+        studies,
+        active_output_dir,
+        existing_df=active_existing_df,
+    )
+
+    log.info(
+        f"Ολοκληρώθηκε. "
+        f"Σύνολο: {len(predictions_df)} studies → "
+        f"{active_output_dir / 'predictions_raw_.csv'}"
+    )
+
+
+# =============================================================================
+#  ΡΥΘΜΙΣΕΙΣ — συμπλήρωσε τα paths σου εδώ και πάτα F5
+# =============================================================================
+if __name__ == "__main__":
+
+    DATASET_ROOT   = r"D:\ORGANIZED_DATA"
+    OUTPUT_DIR     = r"D:\Data Ippokrateio\Evaluation_results_full_dataset_v2"
+    EXCLUSION_LIST = r"D:\Data Ippokrateio\Ippokrateio documents\Study_pair_audit\unique_ids_v3.txt"
+    # Αν δεν έχεις exclusion list βάλε: None
+
+    DEVICE         = "cuda"   # "cuda" αν έχεις GPU, "cpu" αλλιώς
+    RESUME         = False    # True για να συνεχίσει από όπου σταμάτησε
+
+    # ── Pilot mode ───────────────────────────────────────────────────────────
+    # MAX_STUDIES = 10   → επεξεργάζεται μόνο τα πρώτα 10 studies (δοκιμή)
+    #                       αποτελέσματα → OUTPUT_DIR/pilot/predictions_raw_.csv
+    # MAX_STUDIES = None → επεξεργάζεται ολόκληρο το dataset (κανονική εκτέλεση)
+    #                       αποτελέσματα → OUTPUT_DIR/predictions_raw_.csv
+    MAX_STUDIES    = None
+
+    main(
+        dataset_root   = DATASET_ROOT,
+        output_dir     = OUTPUT_DIR,
+        exclusion_list = EXCLUSION_LIST,
+        device         = DEVICE,
+        resume         = RESUME,
+        max_studies    = MAX_STUDIES,
+    )
