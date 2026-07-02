@@ -1,0 +1,677 @@
+"""
+=============================================================================
+EchoPrime Evaluator v6.0 — Multi-Threshold Trials
+=============================================================================
+Runs 5 evaluation trials per feature, each with a different threshold-selection
+strategy. AUROC and AUPRC are threshold-independent and computed once per
+feature; Sensitivity / Specificity / PPV / NPV / Confusion Matrix depend on
+the operating point and are recomputed per trial.
+
+Trials:
+  1. Youden's J        — argmax(TPR − FPR) on the ROC curve
+  2. Sensitivity ≥ 90% — lowest threshold satisfying sens ≥ 0.90
+  3. Sensitivity ≥ 95% — lowest threshold satisfying sens ≥ 0.95
+  4. Specificity ≥ 90% — highest threshold satisfying spec ≥ 0.90
+  5. Specificity ≥ 95% — highest threshold satisfying spec ≥ 0.95
+
+Per binary feature (17 cardiac features):
+  - AUROC with 95% CI  (bootstrap, 10,000 iterations) — once
+  - AUPRC with 95% CI  (bootstrap, 10,000 iterations) — once
+  - Per-trial: chosen threshold, Sens / Spec / PPV / NPV with 95% CI,
+    confusion matrix (TP/FP/TN/FN), and confusion-matrix heatmap.
+
+Outputs:
+  - One Excel workbook with one Summary sheet per trial + a Full_Metrics
+    sheet per trial + a Thresholds sheet listing all chosen operating points.
+  - ROC curve per feature (with all 5 operating points marked) — once.
+  - PR curve per feature — once.
+  - Confusion matrix per (feature × trial) — 17 × 5 = 85 plots.
+=============================================================================
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, roc_curve,
+    precision_recall_curve, confusion_matrix
+)
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+GROUND_TRUTH_FILE = r"D:\Data Ippokrateio\Evaluation_results_full_dataset\ground_truth_merged.csv"
+PREDICTIONS_FILE  = r"D:\Data Ippokrateio\Evaluation_results_full_dataset\predictions_merged.csv"
+EXCLUSION_FILES = [
+    r"D:\Data Ippokrateio\Evaluation_results_full_dataset\merged_ids_all_unique_updated.txt"
+]
+
+OUTPUT_EXCEL      = r"D:\Data Ippokrateio\Evaluation_results_full_dataset_v2\evaluation_full_metrics_threshold_v7.xlsx"
+OUTPUT_PLOTS_DIR  = r"D:\Data Ippokrateio\Evaluation_results_full_dataset_v2\plots_v7"
+
+GT_ID_COLUMN   = "exam_id"
+PRED_ID_COLUMN = "study_id"
+
+N_BOOTSTRAPS   = 10000
+RANDOM_SEED    = 42
+
+# Trial definitions — each is a (key, display_name, strategy, target) tuple.
+# strategy: 'youden' | 'min_sensitivity' | 'min_specificity'
+# target:   None for Youden; otherwise the minimum required sens/spec value.
+TRIALS = [
+    ('trial1_youden',     "Trial 1 — Youden's J",        'youden',          None),
+    ('trial2_sens90',     "Trial 2 — Sensitivity ≥ 90%", 'min_sensitivity', 0.90),
+    ('trial3_sens95',     "Trial 3 — Sensitivity ≥ 95%", 'min_sensitivity', 0.95),
+    ('trial4_spec90',     "Trial 4 — Specificity ≥ 90%", 'min_specificity', 0.90),
+    ('trial5_spec95',     "Trial 5 — Specificity ≥ 95%", 'min_specificity', 0.95),
+]
+
+FEATURES = [
+    'pacemaker',
+    'rv_systolic_function_depressed',
+    'right_ventricle_dilation',
+    'right_atrium_dilation',
+    'left_atrium_dilation',
+    'mitraclip',
+    'mitral_annular_calcification',
+    'mitral_stenosis',
+    'mitral_regurgitation',
+    'tavr',
+    'bicuspid_aov_morphology',
+    'aortic_stenosis',
+    'aortic_regurgitation',
+    'aortic_root_dilation',
+    'tricuspid_valve_regurgitation',
+    'pericardial_effusion',
+    'dilated_ivc',
+]
+
+FEATURE_DISPLAY_NAMES = {
+    'pacemaker': 'Pacemaker',
+    'rv_systolic_function_depressed': 'RV Systolic Function',
+    'right_ventricle_dilation': 'RV Dilation',
+    'right_atrium_dilation': 'RA Dilation',
+    'left_atrium_dilation': 'LA Dilation',
+    'mitraclip': 'MitraClip',
+    'mitral_annular_calcification': 'Mitral Annular Calcification',
+    'mitral_stenosis': 'Mitral Stenosis',
+    'mitral_regurgitation': 'Mitral Regurgitation',
+    'tavr': 'TAVR',
+    'bicuspid_aov_morphology': 'Bicuspid AV',
+    'aortic_stenosis': 'Aortic Stenosis',
+    'aortic_regurgitation': 'Aortic Regurgitation',
+    'aortic_root_dilation': 'Aortic Root Dilation',
+    'tricuspid_valve_regurgitation': 'Tricuspid Regurgitation',
+    'pericardial_effusion': 'Pericardial Effusion',
+    'dilated_ivc': 'Dilated IVC',
+}
+
+
+# =============================================================================
+# THRESHOLD SELECTION
+# =============================================================================
+
+def select_threshold(y_true, y_pred_proba, strategy, target=None):
+    """
+    Pick an operating point on the ROC curve according to the requested
+    strategy. Returns (threshold, achieved_sens, achieved_spec).
+
+    Strategies
+    ----------
+    youden : argmax(TPR − FPR). Standard balanced operating point.
+    min_sensitivity : lowest threshold with TPR ≥ target. Among ties on TPR,
+                      we keep the highest threshold (= best specificity)
+                      because sklearn's roc_curve already returns thresholds
+                      in decreasing order.
+    min_specificity : highest threshold with (1 − FPR) ≥ target. Among ties,
+                      we keep the lowest threshold (= best sensitivity).
+
+    If the constraint cannot be satisfied (e.g. dataset is too small or the
+    classifier never reaches that sensitivity), we fall back to the threshold
+    that gets closest to the target and flag it in the returned spec/sens.
+    """
+    fpr, tpr, thr = roc_curve(y_true, y_pred_proba)
+    # sklearn prepends a +inf threshold so the curve starts at (0, 0).
+    # That sentinel is not a real operating point — drop it.
+    valid = np.isfinite(thr)
+    fpr, tpr, thr = fpr[valid], tpr[valid], thr[valid]
+
+    if len(thr) == 0:
+        return 0.5, np.nan, np.nan
+
+    spec = 1.0 - fpr  # specificity at each operating point
+
+    if strategy == 'youden':
+        j = tpr - fpr
+        idx = int(np.argmax(j))
+        return float(thr[idx]), float(tpr[idx]), float(spec[idx])
+
+    if strategy == 'min_sensitivity':
+        # We want sens ≥ target while keeping spec as high as possible.
+        # roc_curve returns thresholds in *decreasing* order, so as we move
+        # forward in the array TPR is non-decreasing. The first index that
+        # meets the target is also the one with the highest threshold (best
+        # specificity) among those that meet it.
+        eligible = np.where(tpr >= target)[0]
+        if len(eligible) == 0:
+            idx = int(np.argmax(tpr))  # best we can do
+        else:
+            idx = int(eligible[0])
+        return float(thr[idx]), float(tpr[idx]), float(spec[idx])
+
+    if strategy == 'min_specificity':
+        # We want spec ≥ target while keeping sens as high as possible.
+        # spec is non-increasing along the array (since FPR is non-decreasing),
+        # so the *last* index that satisfies the constraint maximizes TPR.
+        eligible = np.where(spec >= target)[0]
+        if len(eligible) == 0:
+            idx = int(np.argmax(spec))
+        else:
+            idx = int(eligible[-1])
+        return float(thr[idx]), float(tpr[idx]), float(spec[idx])
+
+    raise ValueError(f"Unknown threshold strategy: {strategy}")
+
+
+# =============================================================================
+# BOOTSTRAPPING ENGINE
+# =============================================================================
+
+def bootstrap_metric(y_true, y_pred, metric_fn, n_bootstraps, seed, needs_both_classes=True):
+    """Generic bootstrapper. See v5 docstring; behavior unchanged."""
+    rng = np.random.RandomState(seed)
+    point_estimate = metric_fn(y_true, y_pred)
+
+    bootstrapped_scores = []
+    for _ in range(n_bootstraps):
+        indices = rng.randint(0, len(y_true), len(y_true))
+        y_t = y_true[indices]
+        y_p = y_pred[indices]
+
+        if needs_both_classes and len(np.unique(y_t)) < 2:
+            continue
+
+        try:
+            score = metric_fn(y_t, y_p)
+            bootstrapped_scores.append(score)
+        except (ValueError, ZeroDivisionError):
+            continue
+
+    if len(bootstrapped_scores) == 0:
+        return point_estimate, np.nan, np.nan
+
+    sorted_scores = np.sort(bootstrapped_scores)
+    ci_lower = np.percentile(sorted_scores, 2.5)
+    ci_upper = np.percentile(sorted_scores, 97.5)
+
+    return point_estimate, ci_lower, ci_upper
+
+
+# =============================================================================
+# METRIC FUNCTIONS
+# =============================================================================
+
+def _sensitivity(y_true, y_pred_binary):
+    tp = np.sum((y_pred_binary == 1) & (y_true == 1))
+    fn = np.sum((y_pred_binary == 0) & (y_true == 1))
+    denom = tp + fn
+    return tp / denom if denom > 0 else np.nan
+
+def _specificity(y_true, y_pred_binary):
+    tn = np.sum((y_pred_binary == 0) & (y_true == 0))
+    fp = np.sum((y_pred_binary == 1) & (y_true == 0))
+    denom = tn + fp
+    return tn / denom if denom > 0 else np.nan
+
+def _ppv(y_true, y_pred_binary):
+    tp = np.sum((y_pred_binary == 1) & (y_true == 1))
+    fp = np.sum((y_pred_binary == 1) & (y_true == 0))
+    denom = tp + fp
+    return tp / denom if denom > 0 else np.nan
+
+def _npv(y_true, y_pred_binary):
+    tn = np.sum((y_pred_binary == 0) & (y_true == 0))
+    fn = np.sum((y_pred_binary == 0) & (y_true == 1))
+    denom = tn + fn
+    return tn / denom if denom > 0 else np.nan
+
+
+# =============================================================================
+# PLOTTING FUNCTIONS
+# =============================================================================
+
+def plot_roc_curve_with_operating_points(y_true, y_pred, auroc, ci_lower, ci_upper,
+                                         feature_name, operating_points, save_path):
+    """ROC curve with every trial's operating point overlaid."""
+    fpr, tpr, _ = roc_curve(y_true, y_pred)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    ax.plot(fpr, tpr, color='#2563EB', lw=2.0,
+            label=f'AUROC = {auroc:.3f} ({ci_lower:.3f}–{ci_upper:.3f})')
+    ax.plot([0, 1], [0, 1], color='#9CA3AF', lw=1.0, linestyle='--', label='Random Classifier')
+    ax.fill_between(fpr, tpr, alpha=0.08, color='#2563EB')
+
+    # Mark each trial's operating point: x = 1 − spec, y = sens.
+    marker_styles = ['o', 's', 'D', '^', 'v']
+    colors = ['#DC2626', '#F59E0B', '#10B981', '#7C3AED', '#0EA5E9']
+    for i, (label, sens, spec, thr) in enumerate(operating_points):
+        if np.isnan(sens) or np.isnan(spec):
+            continue
+        ax.scatter(1 - spec, sens, s=110, marker=marker_styles[i % 5],
+                   color=colors[i % 5], edgecolor='black', linewidth=1.2, zorder=5,
+                   label=f'{label} | thr={thr:.3f} | sens={sens:.3f}, spec={spec:.3f}')
+
+    ax.set_xlabel('False Positive Rate (1 − Specificity)', fontsize=12)
+    ax.set_ylabel('True Positive Rate (Sensitivity)', fontsize=12)
+    ax.set_title(f'ROC Curve — {feature_name}', fontsize=13, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_pr_curve(y_true, y_pred, auprc, ci_lower, ci_upper, feature_name, prevalence, save_path):
+    precision, recall, _ = precision_recall_curve(y_true, y_pred)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+    ax.plot(recall, precision, color='#DC2626', lw=2.0,
+            label=f'AUPRC = {auprc:.3f} ({ci_lower:.3f}–{ci_upper:.3f})')
+    ax.axhline(y=prevalence, color='#9CA3AF', lw=1.0, linestyle='--',
+               label=f'Prevalence = {prevalence:.3f}')
+    ax.fill_between(recall, precision, alpha=0.08, color='#DC2626')
+
+    ax.set_xlabel('Recall (Sensitivity)', fontsize=12)
+    ax.set_ylabel('Precision (PPV)', fontsize=12)
+    ax.set_title(f'Precision-Recall Curve — {feature_name}', fontsize=13, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_confusion_matrix(cm, feature_name, trial_label, threshold, save_path):
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    total = cm.sum()
+    cm_pct = cm / total * 100 if total > 0 else cm * 0.0
+
+    annot_labels = np.array([
+        [f"{cm[i, j]}\n({cm_pct[i, j]:.1f}%)" for j in range(2)]
+        for i in range(2)
+    ])
+
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    for i in range(2):
+        for j in range(2):
+            text_color = 'white' if cm[i, j] > cm.max() / 2 else 'black'
+            ax.text(j, i, annot_labels[i, j], ha='center', va='center',
+                    fontsize=13, color=text_color, fontweight='bold')
+
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Negative', 'Positive'], fontsize=11)
+    ax.set_yticklabels(['Negative', 'Positive'], fontsize=11)
+    ax.set_xlabel('Predicted Label', fontsize=12)
+    ax.set_ylabel('True Label', fontsize=12)
+    ax.set_title(f'Confusion Matrix — {feature_name}\n{trial_label} (thr = {threshold:.3f})',
+                 fontsize=12, fontweight='bold')
+
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
+# =============================================================================
+# PER-TRIAL EVALUATION
+# =============================================================================
+
+def evaluate_at_threshold(y_true, y_pred_proba, threshold,
+                          n_bootstraps=N_BOOTSTRAPS, seed=RANDOM_SEED):
+    """Compute Sens/Spec/PPV/NPV (with 95% CIs) and the confusion matrix
+    for a given operating threshold."""
+    y_pred_binary = (y_pred_proba >= threshold).astype(int)
+
+    sens, sens_lo, sens_hi = bootstrap_metric(
+        y_true, y_pred_binary, _sensitivity, n_bootstraps, seed, needs_both_classes=False)
+    spec, spec_lo, spec_hi = bootstrap_metric(
+        y_true, y_pred_binary, _specificity, n_bootstraps, seed, needs_both_classes=False)
+    ppv_val, ppv_lo, ppv_hi = bootstrap_metric(
+        y_true, y_pred_binary, _ppv, n_bootstraps, seed, needs_both_classes=False)
+    npv_val, npv_lo, npv_hi = bootstrap_metric(
+        y_true, y_pred_binary, _npv, n_bootstraps, seed, needs_both_classes=False)
+
+    cm = confusion_matrix(y_true, y_pred_binary, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    return {
+        'threshold': threshold,
+        'sens': sens, 'sens_lo': sens_lo, 'sens_hi': sens_hi,
+        'spec': spec, 'spec_lo': spec_lo, 'spec_hi': spec_hi,
+        'ppv':  ppv_val, 'ppv_lo':  ppv_lo, 'ppv_hi':  ppv_hi,
+        'npv':  npv_val, 'npv_lo':  npv_lo, 'npv_hi':  npv_hi,
+        'tp': int(tp), 'fp': int(fp), 'tn': int(tn), 'fn': int(fn),
+        'cm': cm,
+    }
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def run_evaluation():
+    print("=" * 72)
+    print("  EchoPrime Full Metrics Evaluator v6.0")
+    print("  Metrics: AUROC, AUPRC, Sens, Spec, PPV, NPV (across 5 trials)")
+    print(f"  Method:  {N_BOOTSTRAPS:,} Bootstrap Iterations | 95% CI")
+    print("=" * 72)
+    print("  Trials:")
+    for _, name, _, _ in TRIALS:
+        print(f"    • {name}")
+    print("=" * 72)
+
+    # ----- 1. Load Data -----
+    print("\n[1/5] Loading data...")
+    df_gt = pd.read_csv(GROUND_TRUTH_FILE) if GROUND_TRUTH_FILE.endswith('.csv') else pd.read_excel(GROUND_TRUTH_FILE)
+    df_pred = pd.read_csv(PREDICTIONS_FILE) if PREDICTIONS_FILE.endswith('.csv') else pd.read_excel(PREDICTIONS_FILE)
+    print(f"  Ground Truth:  {df_gt.shape[0]} rows, {df_gt.shape[1]} columns")
+    print(f"  Predictions:   {df_pred.shape[0]} rows, {df_pred.shape[1]} columns")
+
+    # ----- 2. Merge -----
+    actual_pred_id = PRED_ID_COLUMN if PRED_ID_COLUMN in df_pred.columns else GT_ID_COLUMN
+    df_merged = pd.merge(df_gt, df_pred, left_on=GT_ID_COLUMN, right_on=actual_pred_id, suffixes=('_gt', '_pred'))
+    print(f"  Merged:        {len(df_merged)} matched examinations")
+
+    # ----- 3. Apply Exclusions -----
+    all_exclude_ids = set()
+    
+    for excl_file in EXCLUSION_FILES:
+        if os.path.exists(excl_file):
+            try:
+                with open(excl_file, 'r', encoding='utf-8') as f:
+                    # Προσθήκη των IDs στο κοινό set
+                    all_exclude_ids.update([line.strip() for line in f if line.strip()])
+            except Exception as e:
+                print(f"  [ERROR] Could not read exclusion file: {e}")
+        else:
+            print(f"  [INFO] No exclusion file found at: {excl_file}")
+
+    if all_exclude_ids:
+        initial_count = len(df_merged)
+        df_merged = df_merged[~df_merged[GT_ID_COLUMN].astype(str).isin([str(i) for i in all_exclude_ids])]
+        removed = initial_count - len(df_merged)
+        print(f"  Excluded:      {removed} examinations (from {len(EXCLUSION_FILES)} exclusion files)")
+    else:
+        print("  [INFO] No IDs to exclude were found in the provided files.")
+
+    n_samples = len(df_merged)
+
+    # ----- 4. Output directories -----
+    os.makedirs(os.path.dirname(OUTPUT_EXCEL), exist_ok=True)
+    os.makedirs(OUTPUT_PLOTS_DIR, exist_ok=True)
+    roc_dir = os.path.join(OUTPUT_PLOTS_DIR, 'roc_curves')
+    pr_dir  = os.path.join(OUTPUT_PLOTS_DIR, 'pr_curves')
+    cm_root = os.path.join(OUTPUT_PLOTS_DIR, 'confusion_matrices')
+    os.makedirs(roc_dir, exist_ok=True)
+    os.makedirs(pr_dir, exist_ok=True)
+    # one subfolder per trial for the confusion matrices
+    for trial_key, _, _, _ in TRIALS:
+        os.makedirs(os.path.join(cm_root, trial_key), exist_ok=True)
+
+    # ----- 5. Evaluate each feature × each trial -----
+    print(f"\n[2/5] Computing metrics across {len(TRIALS)} trials × {len(FEATURES)} features...")
+
+    # Per-trial accumulators (one row per feature, per trial)
+    per_trial_rows = {trial_key: [] for trial_key, _, _, _ in TRIALS}
+    # Threshold log: one row per (feature × trial)
+    threshold_rows = []
+
+    for feature in tqdm(FEATURES, desc="Evaluating Features"):
+        col_gt = f"{feature}_gt"
+        col_pred = f"{feature}_pred"
+        display_name = FEATURE_DISPLAY_NAMES.get(feature, feature)
+
+        if col_gt not in df_merged.columns or col_pred not in df_merged.columns:
+            print(f"\n  [WARNING] Missing columns for '{feature}'. Skipping.")
+            continue
+
+        df_valid = df_merged[[col_gt, col_pred]].dropna()
+        y_true = df_valid[col_gt].values.astype(float)
+        y_pred_proba = df_valid[col_pred].values.astype(float)
+
+        n_positive = int(y_true.sum())
+        n_negative = int(len(y_true) - n_positive)
+        n_total = len(y_true)
+        prevalence = n_positive / n_total if n_total > 0 else 0.0
+
+        # Single-class guard: AUROC/AUPRC undefined, all trials NaN.
+        if len(np.unique(y_true)) < 2:
+            print(f"\n  [WARNING] '{feature}' has only 1 class. Filling NaNs across all trials.")
+            for trial_key, trial_name, _, _ in TRIALS:
+                per_trial_rows[trial_key].append({
+                    'Feature': display_name,
+                    'AUROC': np.nan, 'AUROC_CI_Lower': np.nan, 'AUROC_CI_Upper': np.nan,
+                    'AUPRC': np.nan, 'AUPRC_CI_Lower': np.nan, 'AUPRC_CI_Upper': np.nan,
+                    'Threshold': np.nan,
+                    'Sensitivity': np.nan, 'Sens_CI_Lower': np.nan, 'Sens_CI_Upper': np.nan,
+                    'Specificity': np.nan, 'Spec_CI_Lower': np.nan, 'Spec_CI_Upper': np.nan,
+                    'PPV': np.nan, 'PPV_CI_Lower': np.nan, 'PPV_CI_Upper': np.nan,
+                    'NPV': np.nan, 'NPV_CI_Lower': np.nan, 'NPV_CI_Upper': np.nan,
+                    'TP': 0, 'FP': 0, 'TN': 0, 'FN': 0,
+                    'Positive_Samples': n_positive, 'Negative_Samples': n_negative,
+                    'Total_Samples': n_total, 'Prevalence': prevalence,
+                })
+                threshold_rows.append({
+                    'Feature': display_name, 'Trial': trial_name,
+                    'Threshold': np.nan, 'Achieved_Sensitivity': np.nan,
+                    'Achieved_Specificity': np.nan, 'Constraint_Met': False,
+                })
+            continue
+
+        # ---- Threshold-independent: AUROC / AUPRC, computed once ----
+        auroc, auroc_lo, auroc_hi = bootstrap_metric(
+            y_true, y_pred_proba, roc_auc_score, N_BOOTSTRAPS, RANDOM_SEED)
+        auprc, auprc_lo, auprc_hi = bootstrap_metric(
+            y_true, y_pred_proba, average_precision_score, N_BOOTSTRAPS, RANDOM_SEED)
+
+        # ---- One PR curve per feature ----
+        plot_pr_curve(y_true, y_pred_proba, auprc, auprc_lo, auprc_hi,
+                      display_name, prevalence,
+                      os.path.join(pr_dir, f'pr_{feature}.png'))
+
+        # ---- Iterate through the 5 trials ----
+        operating_points_for_roc = []  # for the combined ROC plot
+
+        for trial_key, trial_name, strategy, target in TRIALS:
+            thr, achieved_sens, achieved_spec = select_threshold(
+                y_true, y_pred_proba, strategy, target)
+
+            # Did the constraint actually get met?
+            if strategy == 'youden':
+                constraint_met = True
+            elif strategy == 'min_sensitivity':
+                constraint_met = bool(achieved_sens >= target) if not np.isnan(achieved_sens) else False
+            elif strategy == 'min_specificity':
+                constraint_met = bool(achieved_spec >= target) if not np.isnan(achieved_spec) else False
+            else:
+                constraint_met = False
+
+            metrics = evaluate_at_threshold(y_true, y_pred_proba, thr)
+
+            # Confusion matrix plot for this (feature, trial)
+            plot_confusion_matrix(
+                metrics['cm'], display_name, trial_name, thr,
+                os.path.join(cm_root, trial_key, f'cm_{feature}.png'))
+
+            operating_points_for_roc.append(
+                (trial_name, metrics['sens'], metrics['spec'], thr))
+
+            per_trial_rows[trial_key].append({
+                'Feature': display_name,
+                'AUROC': round(auroc, 3),
+                'AUROC_CI_Lower': round(auroc_lo, 3),
+                'AUROC_CI_Upper': round(auroc_hi, 3),
+                'AUPRC': round(auprc, 3),
+                'AUPRC_CI_Lower': round(auprc_lo, 3),
+                'AUPRC_CI_Upper': round(auprc_hi, 3),
+                'Threshold': round(thr, 4),
+                'Sensitivity': round(metrics['sens'], 3),
+                'Sens_CI_Lower': round(metrics['sens_lo'], 3),
+                'Sens_CI_Upper': round(metrics['sens_hi'], 3),
+                'Specificity': round(metrics['spec'], 3),
+                'Spec_CI_Lower': round(metrics['spec_lo'], 3),
+                'Spec_CI_Upper': round(metrics['spec_hi'], 3),
+                'PPV': round(metrics['ppv'], 3),
+                'PPV_CI_Lower': round(metrics['ppv_lo'], 3),
+                'PPV_CI_Upper': round(metrics['ppv_hi'], 3),
+                'NPV': round(metrics['npv'], 3),
+                'NPV_CI_Lower': round(metrics['npv_lo'], 3),
+                'NPV_CI_Upper': round(metrics['npv_hi'], 3),
+                'TP': metrics['tp'], 'FP': metrics['fp'],
+                'TN': metrics['tn'], 'FN': metrics['fn'],
+                'Positive_Samples': n_positive, 'Negative_Samples': n_negative,
+                'Total_Samples': n_total, 'Prevalence': round(prevalence, 4),
+                'Constraint_Met': constraint_met,
+            })
+
+            threshold_rows.append({
+                'Feature': display_name,
+                'Trial': trial_name,
+                'Threshold': round(thr, 4),
+                'Achieved_Sensitivity': round(metrics['sens'], 4),
+                'Achieved_Specificity': round(metrics['spec'], 4),
+                'Constraint_Met': constraint_met,
+            })
+
+        # ---- Single ROC plot per feature with all 5 operating points marked ----
+        plot_roc_curve_with_operating_points(
+            y_true, y_pred_proba, auroc, auroc_lo, auroc_hi, display_name,
+            operating_points_for_roc,
+            os.path.join(roc_dir, f'roc_{feature}.png'))
+
+    # ----- 6. Build per-trial DataFrames -----
+    print("\n[3/5] Building results tables...")
+
+    def fmt_ci(row, metric, lo_col, hi_col):
+        if pd.isna(row[metric]):
+            return "N/A"
+        return f"{row[metric]:.3f} ({row[lo_col]:.3f}–{row[hi_col]:.3f})"
+
+    trial_dfs = {}
+    for trial_key, trial_name, _, _ in TRIALS:
+        df_trial = pd.DataFrame(per_trial_rows[trial_key])
+        if df_trial.empty:
+            trial_dfs[trial_key] = (trial_name, df_trial)
+            continue
+
+        df_trial['AUROC (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'AUROC', 'AUROC_CI_Lower', 'AUROC_CI_Upper'), axis=1)
+        df_trial['AUPRC (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'AUPRC', 'AUPRC_CI_Lower', 'AUPRC_CI_Upper'), axis=1)
+        df_trial['Sensitivity (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'Sensitivity', 'Sens_CI_Lower', 'Sens_CI_Upper'), axis=1)
+        df_trial['Specificity (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'Specificity', 'Spec_CI_Lower', 'Spec_CI_Upper'), axis=1)
+        df_trial['PPV (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'PPV', 'PPV_CI_Lower', 'PPV_CI_Upper'), axis=1)
+        df_trial['NPV (95% CI)'] = df_trial.apply(
+            lambda r: fmt_ci(r, 'NPV', 'NPV_CI_Lower', 'NPV_CI_Upper'), axis=1)
+        trial_dfs[trial_key] = (trial_name, df_trial)
+
+    df_thresholds = pd.DataFrame(threshold_rows)
+
+    # ----- 7. Save to Excel -----
+    print("\n[4/5] Saving results to Excel...")
+
+    summary_cols = [
+        'Feature', 'AUROC (95% CI)', 'AUPRC (95% CI)',
+        'Threshold',
+        'Sensitivity (95% CI)', 'Specificity (95% CI)',
+        'PPV (95% CI)', 'NPV (95% CI)',
+        'Positive_Samples', 'Negative_Samples', 'Total_Samples', 'Prevalence',
+        'Constraint_Met',
+    ]
+
+    # Excel sheet names: max 31 chars, no special chars.
+    def safe_sheet_name(name, suffix=''):
+        base = name.replace('—', '-').replace('≥', '>=')
+        full = (base + suffix)[:31]
+        return full
+
+    with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
+        # One Summary sheet + one Full sheet per trial
+        for trial_key, (trial_name, df_trial) in trial_dfs.items():
+            if df_trial.empty:
+                continue
+            cols_present = [c for c in summary_cols if c in df_trial.columns]
+            df_trial[cols_present].to_excel(
+                writer, sheet_name=safe_sheet_name(trial_name, ' Sum'), index=False)
+            df_trial.to_excel(
+                writer, sheet_name=safe_sheet_name(trial_name, ' Full'), index=False)
+
+        # Cross-trial threshold log
+        df_thresholds.to_excel(writer, sheet_name='Thresholds', index=False)
+
+        # Cross-trial comparison: one row per feature, sens/spec across trials
+        comparison = None
+        for trial_key, (trial_name, df_trial) in trial_dfs.items():
+            if df_trial.empty:
+                continue
+            sub = df_trial[['Feature', 'Threshold', 'Sensitivity', 'Specificity', 'PPV', 'NPV']].copy()
+            sub.columns = ['Feature',
+                           f'{trial_name} | thr',
+                           f'{trial_name} | Sens',
+                           f'{trial_name} | Spec',
+                           f'{trial_name} | PPV',
+                           f'{trial_name} | NPV']
+            comparison = sub if comparison is None else comparison.merge(sub, on='Feature', how='outer')
+        if comparison is not None:
+            comparison.to_excel(writer, sheet_name='Cross_Trial_Comparison', index=False)
+
+    # ----- 8. Console Summary -----
+    print("\n[5/5] Evaluation Complete!")
+    print("=" * 110)
+    for trial_key, (trial_name, df_trial) in trial_dfs.items():
+        if df_trial.empty:
+            continue
+        print(f"\n>>> {trial_name}")
+        print("-" * 110)
+        print(f"{'Feature':<30} | {'Threshold':>9} | {'Sens':>6} | {'Spec':>6} | {'PPV':>6} | {'NPV':>6} | {'Met':>5}")
+        print("-" * 110)
+        for _, row in df_trial.iterrows():
+            thr_str  = f"{row['Threshold']:.3f}"   if pd.notna(row['Threshold'])   else "N/A"
+            sens_str = f"{row['Sensitivity']:.3f}" if pd.notna(row['Sensitivity']) else "N/A"
+            spec_str = f"{row['Specificity']:.3f}" if pd.notna(row['Specificity']) else "N/A"
+            ppv_str  = f"{row['PPV']:.3f}"         if pd.notna(row['PPV'])         else "N/A"
+            npv_str  = f"{row['NPV']:.3f}"         if pd.notna(row['NPV'])         else "N/A"
+            met_str  = "Y" if row.get('Constraint_Met', False) else "N"
+            print(f"{row['Feature']:<30} | {thr_str:>9} | {sens_str:>6} | {spec_str:>6} | {ppv_str:>6} | {npv_str:>6} | {met_str:>5}")
+
+    print("\n" + "=" * 110)
+    print(f"  Excel:  {OUTPUT_EXCEL}")
+    print(f"  Plots:  {OUTPUT_PLOTS_DIR}/")
+    print(f"          ├── roc_curves/                 ({len(FEATURES)} ROC curves, all 5 op-points marked)")
+    print(f"          ├── pr_curves/                  ({len(FEATURES)} PR curves)")
+    print(f"          └── confusion_matrices/")
+    for trial_key, trial_name, _, _ in TRIALS:
+        print(f"              └── {trial_key}/  ({len(FEATURES)} matrices — {trial_name})")
+    print(f"\n  Bootstrap iterations: {N_BOOTSTRAPS:,}")
+    print(f"  Random seed:          {RANDOM_SEED}")
+
+
+if __name__ == '__main__':
+    run_evaluation()
