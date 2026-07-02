@@ -1,6 +1,6 @@
 """
 =============================================================================
-EchoPrime Evaluator v6.0 — Multi-Threshold Trials
+EchoPrime Evaluator — Multi-Threshold Trials
 =============================================================================
 Runs 5 evaluation trials per feature, each with a different threshold-selection
 strategy. AUROC and AUPRC are threshold-independent and computed once per
@@ -8,13 +8,13 @@ feature; Sensitivity / Specificity / PPV / NPV / Confusion Matrix depend on
 the operating point and are recomputed per trial.
 
 Trials:
-  1. Youden's J        — argmax(TPR − FPR) on the ROC curve
-  2. Sensitivity ≥ 90% — lowest threshold satisfying sens ≥ 0.90
-  3. Sensitivity ≥ 95% — lowest threshold satisfying sens ≥ 0.95
-  4. Specificity ≥ 90% — highest threshold satisfying spec ≥ 0.90
-  5. Specificity ≥ 95% — highest threshold satisfying spec ≥ 0.95
+  1. Youden's J        — argmax(TPR - FPR) on the ROC curve
+  2. Sensitivity >= 90% — lowest threshold satisfying sens >= 0.90
+  3. Sensitivity >= 95% — lowest threshold satisfying sens >= 0.95
+  4. Specificity >= 90% — highest threshold satisfying spec >= 0.90
+  5. Specificity >= 95% — highest threshold satisfying spec >= 0.95
 
-Per binary feature (17 cardiac features):
+Per binary feature:
   - AUROC with 95% CI  (bootstrap, 10,000 iterations) — once
   - AUPRC with 95% CI  (bootstrap, 10,000 iterations) — once
   - Per-trial: chosen threshold, Sens / Spec / PPV / NPV with 95% CI,
@@ -25,7 +25,7 @@ Outputs:
     sheet per trial + a Thresholds sheet listing all chosen operating points.
   - ROC curve per feature (with all 5 operating points marked) — once.
   - PR curve per feature — once.
-  - Confusion matrix per (feature × trial) — 17 × 5 = 85 plots.
+  - Confusion matrix per (feature x trial)
 =============================================================================
 """
 
@@ -46,14 +46,14 @@ from tqdm import tqdm
 # CONFIGURATION
 # =============================================================================
 
-GROUND_TRUTH_FILE = r"D:\Data Ippokrateio\Evaluation_results_full_dataset\ground_truth_merged.csv"
-PREDICTIONS_FILE  = r"D:\Data Ippokrateio\Evaluation_results_full_dataset\predictions_merged.csv"
-EXCLUSION_FILES = [
-    r"D:\Data Ippokrateio\Evaluation_results_full_dataset\merged_ids_all_unique_updated.txt"
+GROUND_TRUTH_FILE = r"path/to/ground_truth_merged.csv"
+PREDICTIONS_FILE  = r"path/to/predictions_merged.csv"
+EXCLUSION_FILES   = [
+    r"path/to/merged_ids_exclusion_list.txt"
 ]
 
-OUTPUT_EXCEL      = r"D:\Data Ippokrateio\Evaluation_results_full_dataset_v2\evaluation_full_metrics_threshold_v7.xlsx"
-OUTPUT_PLOTS_DIR  = r"D:\Data Ippokrateio\Evaluation_results_full_dataset_v2\plots_v7"
+OUTPUT_EXCEL      = r"path/to/output_directory/evaluation_full_metrics_thresholds.xlsx"
+OUTPUT_PLOTS_DIR  = r"path/to/output_directory/plots"
 
 GT_ID_COLUMN   = "exam_id"
 PRED_ID_COLUMN = "study_id"
@@ -66,10 +66,10 @@ RANDOM_SEED    = 42
 # target:   None for Youden; otherwise the minimum required sens/spec value.
 TRIALS = [
     ('trial1_youden',     "Trial 1 — Youden's J",        'youden',          None),
-    ('trial2_sens90',     "Trial 2 — Sensitivity ≥ 90%", 'min_sensitivity', 0.90),
-    ('trial3_sens95',     "Trial 3 — Sensitivity ≥ 95%", 'min_sensitivity', 0.95),
-    ('trial4_spec90',     "Trial 4 — Specificity ≥ 90%", 'min_specificity', 0.90),
-    ('trial5_spec95',     "Trial 5 — Specificity ≥ 95%", 'min_specificity', 0.95),
+    ('trial2_sens90',     "Trial 2 — Sensitivity >= 90%", 'min_sensitivity', 0.90),
+    ('trial3_sens95',     "Trial 3 — Sensitivity >= 95%", 'min_sensitivity', 0.95),
+    ('trial4_spec90',     "Trial 4 — Specificity >= 90%", 'min_specificity', 0.90),
+    ('trial5_spec95',     "Trial 5 — Specificity >= 95%", 'min_specificity', 0.95),
 ]
 
 FEATURES = [
@@ -124,15 +124,15 @@ def select_threshold(y_true, y_pred_proba, strategy, target=None):
 
     Strategies
     ----------
-    youden : argmax(TPR − FPR). Standard balanced operating point.
-    min_sensitivity : lowest threshold with TPR ≥ target. Among ties on TPR,
+    youden : argmax(TPR - FPR). Standard balanced operating point.
+    min_sensitivity : lowest threshold with TPR >= target. Among ties on TPR,
                       we keep the highest threshold (= best specificity)
                       because sklearn's roc_curve already returns thresholds
                       in decreasing order.
-    min_specificity : highest threshold with (1 − FPR) ≥ target. Among ties,
+    min_specificity : highest threshold with (1 - FPR) >= target. Among ties,
                       we keep the lowest threshold (= best sensitivity).
 
-    If the constraint cannot be satisfied (e.g. dataset is too small or the
+    If the constraint cannot be satisfied (e.g., dataset is too small or the
     classifier never reaches that sensitivity), we fall back to the threshold
     that gets closest to the target and flag it in the returned spec/sens.
     """
@@ -153,7 +153,7 @@ def select_threshold(y_true, y_pred_proba, strategy, target=None):
         return float(thr[idx]), float(tpr[idx]), float(spec[idx])
 
     if strategy == 'min_sensitivity':
-        # We want sens ≥ target while keeping spec as high as possible.
+        # We want sens >= target while keeping spec as high as possible.
         # roc_curve returns thresholds in *decreasing* order, so as we move
         # forward in the array TPR is non-decreasing. The first index that
         # meets the target is also the one with the highest threshold (best
@@ -166,7 +166,7 @@ def select_threshold(y_true, y_pred_proba, strategy, target=None):
         return float(thr[idx]), float(tpr[idx]), float(spec[idx])
 
     if strategy == 'min_specificity':
-        # We want spec ≥ target while keeping sens as high as possible.
+        # We want spec >= target while keeping sens as high as possible.
         # spec is non-increasing along the array (since FPR is non-decreasing),
         # so the *last* index that satisfies the constraint maximizes TPR.
         eligible = np.where(spec >= target)[0]
@@ -184,7 +184,9 @@ def select_threshold(y_true, y_pred_proba, strategy, target=None):
 # =============================================================================
 
 def bootstrap_metric(y_true, y_pred, metric_fn, n_bootstraps, seed, needs_both_classes=True):
-    """Generic bootstrapper. See v5 docstring; behavior unchanged."""
+    """
+    Generic bootstrapper for computing point estimates and 95% confidence intervals.
+    """
     rng = np.random.RandomState(seed)
     point_estimate = metric_fn(y_true, y_pred)
 
@@ -248,7 +250,7 @@ def _npv(y_true, y_pred_binary):
 
 def plot_roc_curve_with_operating_points(y_true, y_pred, auroc, ci_lower, ci_upper,
                                          feature_name, operating_points, save_path):
-    """ROC curve with every trial's operating point overlaid."""
+    """Plots the ROC curve with every trial's operating point overlaid."""
     fpr, tpr, _ = roc_curve(y_true, y_pred)
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 7))
@@ -257,7 +259,7 @@ def plot_roc_curve_with_operating_points(y_true, y_pred, auroc, ci_lower, ci_upp
     ax.plot([0, 1], [0, 1], color='#9CA3AF', lw=1.0, linestyle='--', label='Random Classifier')
     ax.fill_between(fpr, tpr, alpha=0.08, color='#2563EB')
 
-    # Mark each trial's operating point: x = 1 − spec, y = sens.
+    # Mark each trial's operating point: x = 1 - spec, y = sens.
     marker_styles = ['o', 's', 'D', '^', 'v']
     colors = ['#DC2626', '#F59E0B', '#10B981', '#7C3AED', '#0EA5E9']
     for i, (label, sens, spec, thr) in enumerate(operating_points):
@@ -267,7 +269,7 @@ def plot_roc_curve_with_operating_points(y_true, y_pred, auroc, ci_lower, ci_upp
                    color=colors[i % 5], edgecolor='black', linewidth=1.2, zorder=5,
                    label=f'{label} | thr={thr:.3f} | sens={sens:.3f}, spec={spec:.3f}')
 
-    ax.set_xlabel('False Positive Rate (1 − Specificity)', fontsize=12)
+    ax.set_xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
     ax.set_ylabel('True Positive Rate (Sensitivity)', fontsize=12)
     ax.set_title(f'ROC Curve — {feature_name}', fontsize=13, fontweight='bold')
     ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
@@ -375,7 +377,7 @@ def evaluate_at_threshold(y_true, y_pred_proba, threshold,
 
 def run_evaluation():
     print("=" * 72)
-    print("  EchoPrime Full Metrics Evaluator v6.0")
+    print("  EchoPrime Full Metrics Evaluator")
     print("  Metrics: AUROC, AUPRC, Sens, Spec, PPV, NPV (across 5 trials)")
     print(f"  Method:  {N_BOOTSTRAPS:,} Bootstrap Iterations | 95% CI")
     print("=" * 72)
@@ -403,7 +405,7 @@ def run_evaluation():
         if os.path.exists(excl_file):
             try:
                 with open(excl_file, 'r', encoding='utf-8') as f:
-                    # Προσθήκη των IDs στο κοινό set
+                    # Add IDs to the shared set
                     all_exclude_ids.update([line.strip() for line in f if line.strip()])
             except Exception as e:
                 print(f"  [ERROR] Could not read exclusion file: {e}")
@@ -428,16 +430,17 @@ def run_evaluation():
     cm_root = os.path.join(OUTPUT_PLOTS_DIR, 'confusion_matrices')
     os.makedirs(roc_dir, exist_ok=True)
     os.makedirs(pr_dir, exist_ok=True)
-    # one subfolder per trial for the confusion matrices
+    
+    # Create one subfolder per trial for the confusion matrices
     for trial_key, _, _, _ in TRIALS:
         os.makedirs(os.path.join(cm_root, trial_key), exist_ok=True)
 
-    # ----- 5. Evaluate each feature × each trial -----
-    print(f"\n[2/5] Computing metrics across {len(TRIALS)} trials × {len(FEATURES)} features...")
+    # ----- 5. Evaluate each feature x each trial -----
+    print(f"\n[2/5] Computing metrics across {len(TRIALS)} trials x {len(FEATURES)} features...")
 
     # Per-trial accumulators (one row per feature, per trial)
     per_trial_rows = {trial_key: [] for trial_key, _, _, _ in TRIALS}
-    # Threshold log: one row per (feature × trial)
+    # Threshold log: one row per (feature x trial)
     threshold_rows = []
 
     for feature in tqdm(FEATURES, desc="Evaluating Features"):
@@ -608,7 +611,7 @@ def run_evaluation():
 
     # Excel sheet names: max 31 chars, no special chars.
     def safe_sheet_name(name, suffix=''):
-        base = name.replace('—', '-').replace('≥', '>=')
+        base = name.replace('—', '-').replace('>=', '>=')
         full = (base + suffix)[:31]
         return full
 
@@ -664,8 +667,8 @@ def run_evaluation():
     print("\n" + "=" * 110)
     print(f"  Excel:  {OUTPUT_EXCEL}")
     print(f"  Plots:  {OUTPUT_PLOTS_DIR}/")
-    print(f"          ├── roc_curves/                 ({len(FEATURES)} ROC curves, all 5 op-points marked)")
-    print(f"          ├── pr_curves/                  ({len(FEATURES)} PR curves)")
+    print(f"          ├── roc_curves/                  ({len(FEATURES)} ROC curves, all 5 op-points marked)")
+    print(f"          ├── pr_curves/                   ({len(FEATURES)} PR curves)")
     print(f"          └── confusion_matrices/")
     for trial_key, trial_name, _, _ in TRIALS:
         print(f"              └── {trial_key}/  ({len(FEATURES)} matrices — {trial_name})")
