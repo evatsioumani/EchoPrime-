@@ -19,6 +19,7 @@ EchoPrime is a foundation model for echocardiography interpretation. It was trai
 
 ## Repository Structure
 
+```
 EchoPrime-Validation/
 │
 ├── Ground_truth_extraction_binary/      # NLP extraction of binary labels from Greek reports
@@ -28,6 +29,7 @@ EchoPrime-Validation/
 ├── Validation_for_regression_tasks/     # Evaluation: MAE, R², CIs
 ├── LICENSE
 └── README.md
+```
 
 ### Ground Truth Extraction
 
@@ -51,7 +53,7 @@ Runs EchoPrime inference on the hospital's DICOM echocardiography studies using 
 
 ## Requirements
 
-- Python 3.8+
+- Python 
 - NVIDIA GPU with CUDA support (tested on RTX 3060 12GB)
 - [EchoPrime](https://github.com/echonet/EchoPrime) (cloned separately)
 - 7-Zip (for CHM report extraction on Windows)
